@@ -35,6 +35,7 @@ class Params:
 
     # test signal
     f_sig: float = 1000.0             # snapped to an FFT bin (coherent)
+    f_sig2: float = 0.0               # >0: twin tone (each at level - 6 dB)
     level_dbfs: float = -1.0          # relative to full modulation
     n_fft: int = 2 ** 15              # FFT length at fs_in
     pad: int = 4096                   # settling samples at fs_in, both ends
@@ -50,6 +51,10 @@ class Params:
     #             The pulse centre then moves by 1/2 tick with the parity of
     #             the quantiser noise -> signal-proportional noise floor.
     bd_split: str = "even"
+    # UPWM linearisation, applied before the shaper:
+    #  "none"  - plain uniform sampling
+    #  "cubic" - m = x - D2(x^3)/24  (see pwm_linearise)
+    pwm_corr: str = "cubic"
 
     # power stage
     vbus: float = 50.0
@@ -347,24 +352,30 @@ def decimate_to_fs(y, p, grid_ratio):
 # ----------------------------------------------------------------------------
 
 def analyse(y, p, kf):
+    """kf: fundamental bin, or (k1, k2) for a twin tone. For a twin tone
+    'thd' holds the in-band IMD (2f1-f2, 2f2-f1, f2-f1, 3rd/2nd order
+    products) and 'thdn' everything except the two tones, both relative
+    to the total rms of the tones."""
     n = p.n_fft
     Y = np.fft.rfft(y) / n * 2
     f = np.arange(len(Y)) * p.fs_in / n
     mag = np.abs(Y)
-    fund = mag[kf]
     band = (f >= 20) & (f <= p.f_band)
-    band[kf] = False
+    tones = list(kf) if isinstance(kf, tuple) else [kf]
+    sig_rms = np.sqrt(np.sum(mag[tones] ** 2) / 2)
+    band[tones] = False
     noise_dist = np.sqrt(np.sum(mag[band] ** 2) / 2)
-    harm = []
-    for h in range(2, 10):
-        kh = h * kf
-        if kh < len(mag) and f[kh] <= p.f_band:
-            harm.append(mag[kh])
-    harm = np.array(harm)
-    thd = np.sqrt(np.sum(harm ** 2)) / fund if len(harm) else 0.0
-    thdn = noise_dist / (fund / np.sqrt(2))
-    return dict(f=f, mag=mag, fund=fund, thd=thd, thdn=thdn,
-                harm_db=20 * np.log10(harm / fund + 1e-30))
+    if len(tones) == 1:
+        k1 = tones[0]
+        prods = [h * k1 for h in range(2, 10)]
+    else:
+        k1, k2 = tones
+        prods = [2 * k1 - k2, 2 * k2 - k1, k2 - k1]
+    harm = np.array([mag[k] for k in prods if 0 < k < len(mag) and f[k] <= p.f_band])
+    thd = np.sqrt(np.sum(harm ** 2) / 2) / sig_rms if len(harm) else 0.0
+    return dict(f=f, mag=mag, fund=mag[tones[0]], thd=thd,
+                thdn=noise_dist / sig_rms,
+                harm_db=20 * np.log10(harm / (sig_rms * np.sqrt(2)) + 1e-30))
 
 
 def run(p: Params, seed=1):
@@ -373,7 +384,13 @@ def run(p: Params, seed=1):
     kf = int(round(p.f_sig * p.n_fft / p.fs_in))
     amp = 10 ** (p.level_dbfs / 20)
     n = np.arange(n_in)
-    x = amp * np.sin(2 * np.pi * kf * n / p.n_fft)
+    if p.f_sig2 > 0:
+        kf2 = int(round(p.f_sig2 * p.n_fft / p.fs_in))
+        x = amp / 2 * (np.sin(2 * np.pi * kf * n / p.n_fft)
+                       + np.sin(2 * np.pi * kf2 * n / p.n_fft))
+        kf = (kf, kf2)
+    else:
+        x = amp * np.sin(2 * np.pi * kf * n / p.n_fft)
 
     xi = interpolate(x, p)[: n_in * p.up]
     t_upd = np.arange(len(xi)) / p.f_upd
@@ -384,6 +401,7 @@ def run(p: Params, seed=1):
     m = xi
     if p.feedforward:
         m = m * p.vbus / vbus_fn(t_upd + 0.5 / p.f_upd)
+    m = pwm_linearise(m, p.pwm_corr)
     m_units = m * p.nh
 
     if p.quantize:
@@ -428,6 +446,27 @@ def run(p: Params, seed=1):
     res["params"] = p
     res["switch_rate"] = (len(ta) + len(tb)) / (n_in / p.fs_in)
     return res
+
+
+def pwm_linearise(x, mode):
+    """Pre-correction of the uniformly sampled BD PWM.
+
+    With the constant-CM split every half period k carries one differential
+    pulse of width w_k (in half periods, w = m) centred at a FIXED position.
+    Its low-frequency spectrum is
+        2/w * sin(w*w/2) * e^{-j w c} = (w - w^3 w^2/24 + ...) e^{-j w c},
+    i.e. the pulse train equals the sample sequence w_k plus (1/24) d^2/dt^2
+    of w_k^3 (time unit = half period). So the baseband sees
+        w_k + D2(w^3)_k / 24,   D2 = second difference,
+    and the inverse is m = x - D2(x^3)/24 (error ~ w^5 term, below -140 dB).
+    FPGA cost: a cube, a second difference, a shift-add (1/24)."""
+    if mode == "none":
+        return x
+    if mode == "cubic":
+        c = x ** 3
+        d2 = np.concatenate((c[:1], c[:-1])) - 2 * c + np.concatenate((c[1:], c[-1:]))
+        return x - d2 / 24
+    raise ValueError(mode)
 
 
 def _ideal_edges(n_high, p):
