@@ -58,7 +58,8 @@ class Params:
     feedforward: bool = False         # scale modulation by measured bus
 
     deadtime: float = 0.0             # s
-    coss: float = 250e-12             # F, per device (energy-equivalent)
+    coss: float = 805e-12             # F, per FET, time-related Coss(TR)
+                                      # ISG3208: 805 pF @ 0-50 V (Qoss 40 nC)
     jitter_rms: float = 0.0           # s, white, per edge
 
     # output filter (per BTL half) + load

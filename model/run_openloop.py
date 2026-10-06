@@ -36,12 +36,13 @@ SCENARIOS = [
     ("Джиттер", "Джиттер 10 пс RMS", dict(jitter_rms=10e-12)),
     ("Джиттер", "Джиттер 50 пс RMS", dict(jitter_rms=50e-12)),
     ("Джиттер", "Джиттер 100 пс RMS", dict(jitter_rms=100e-12)),
+    ("Dead time", "1 нс, 8 Ом", dict(deadtime=1e-9)),
     ("Dead time", "2 нс, 8 Ом", dict(deadtime=2e-9)),
     ("Dead time", "5 нс, 8 Ом", dict(deadtime=5e-9)),
-    ("Dead time", "10 нс, 8 Ом", dict(deadtime=10e-9)),
+    ("Dead time", "2 нс, 4 Ом", dict(deadtime=2e-9, r_load=4.0)),
     ("Dead time", "5 нс, 4 Ом", dict(deadtime=5e-9, r_load=4.0)),
-    ("Dead time", "5 нс, без нагрузки", dict(deadtime=5e-9, r_load=np.inf)),
-    ("Dead time", "5 нс, 8 Ом, −20 дБFS", dict(deadtime=5e-9, level_dbfs=-20)),
+    ("Dead time", "2 нс, без нагрузки", dict(deadtime=2e-9, r_load=np.inf)),
+    ("Dead time", "2 нс, 8 Ом, −20 дБFS", dict(deadtime=2e-9, level_dbfs=-20)),
     ("Питание", "Пульсации шины 1 % / 100 Гц", dict(bus_ripple=0.01)),
     ("Питание", "То же + feedforward", dict(bus_ripple=0.01, feedforward=True)),
 ]
@@ -116,9 +117,9 @@ def main():
                  ["parity (шаг 1 тик, плавающий CM)", "even (шаг 2 тика, CM постоянный)"],
                  [S2, S1], "bd_split.png",
                  "Разбиение BD между плечами: идеальный тракт, 1 кГц −1 дБFS")
-    plot_small_multiples([res["5 нс, 8 Ом"], res["5 нс, 4 Ом"], res["5 нс, без нагрузки"]],
+    plot_small_multiples([res["2 нс, 8 Ом"], res["2 нс, 4 Ом"], res["2 нс, без нагрузки"]],
                          ["8 Ом", "4 Ом", "без нагрузки"], "deadtime_loads.png",
-                         "Dead time 5 нс, open-loop, 1 кГц −1 дБFS")
+                         "Dead time 2 нс (ISG3208, Coss(TR) 805 пФ), open-loop, 1 кГц −1 дБFS")
     plot_overlay([res["Джиттер 100 пс RMS"], res["Джиттер 10 пс RMS"]],
                  ["100 пс RMS", "10 пс RMS"], [S2, S1], "jitter.png",
                  "Джиттер фронтов, 1 кГц −1 дБFS")
