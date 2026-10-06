@@ -36,6 +36,8 @@ SCENARIOS = [
     ("Модулятор", "С коррекцией, 6,6 кГц", dict(f_sig=6600)),
     ("Модулятор", "С коррекцией, 18+19 кГц (IMD)", dict(f_sig=18000, f_sig2=19000)),
     ("Модулятор", "BD-разбиение parity (шаг 1 тик)", dict(bd_split="parity")),
+    ("Ограничитель", "−0,5 дБFS (у самого порога)", dict(level_dbfs=-0.5)),
+    ("Ограничитель", "Перегрузка +3 дБFS", dict(level_dbfs=3.0)),
     ("Джиттер", "Джиттер 10 пс RMS", dict(jitter_rms=10e-12)),
     ("Джиттер", "Джиттер 50 пс RMS", dict(jitter_rms=50e-12)),
     ("Джиттер", "Джиттер 100 пс RMS", dict(jitter_rms=100e-12)),
@@ -98,7 +100,8 @@ def main():
         res[label] = r
         h = r["harm_db"]
         h3 = f"{h[1]:.1f}" if len(h) > 1 else "—"
-        rows.append((group, label, db(r["thdn"]), db(r["thd"]), h3))
+        rows.append((group, label, db(r["thdn"]), db(r["thd"]), h3,
+                     r["min_pulse_ticks"] * r["params"].tick * 1e9))
         print(f"{label:45s} THD+N {db(r['thdn']):7.1f} dB  THD {db(r['thd']):7.1f} dB")
 
     p = Params()
@@ -112,10 +115,12 @@ def main():
                  f"{p.zobel_r} Ом + {p.zobel_c*1e9:.0f} нФ, Coss {p.coss*1e12:.0f} пФ. "
                  f"Сигнал −1 дБFS, 1 кГц, если не указано иное. Полоса 20 Гц–20 кГц.\n\n")
         fh.write("Для двухтонового сигнала колонка THD — это IMD (2f1−f2, 2f2−f1, f2−f1).\n\n")
-        fh.write("| Группа | Сценарий | THD+N, дБ | THD, дБ | H3, дБ |\n")
-        fh.write("|---|---|---:|---:|---:|\n")
-        for g, lab, tn, t, h3 in rows:
-            fh.write(f"| {g} | {lab} | {tn:.1f} | {t:.1f} | {h3} |\n")
+        fh.write("Мин. импульс — самый короткий интервал высокого или низкого уровня на "
+                 "любом плече (у ISG3208 импульсы короче 10 нс отфильтровываются).\n\n")
+        fh.write("| Группа | Сценарий | THD+N, дБ | THD, дБ | H3, дБ | Мин. импульс, нс |\n")
+        fh.write("|---|---|---:|---:|---:|---:|\n")
+        for g, lab, tn, t, h3, mp in rows:
+            fh.write(f"| {g} | {lab} | {tn:.1f} | {t:.1f} | {h3} | {mp:.1f} |\n")
 
     plot_overlay([res["BD-разбиение parity (шаг 1 тик)"], res["С коррекцией, 1 кГц"]],
                  ["parity (шаг 1 тик, плавающий CM)", "even (шаг 2 тика, CM постоянный)"],

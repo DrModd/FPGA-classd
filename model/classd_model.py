@@ -51,6 +51,12 @@ class Params:
     #             The pulse centre then moves by 1/2 tick with the parity of
     #             the quantiser noise -> signal-proportional noise floor.
     bd_split: str = "even"
+    # ISG3208: input pulses < 10 ns are filtered, kept ones are stretched to
+    # 12 ns. Every leg pulse and gap is kept >= min_pulse (incl. dead time
+    # margin): |M| <= nh - n_min ticks, input pre-clipped with some headroom
+    # so the shaper itself does not clip in normal operation.
+    min_pulse: float = 15e-9
+    clip_headroom: int = 6            # ticks between input clip and hard limit
     # UPWM linearisation, applied before the shaper:
     #  "none"  - plain uniform sampling
     #  "cubic" - m = x - D2(x^3)/24  (see pwm_linearise)
@@ -150,13 +156,16 @@ def design_ntf(p):
     return b, a
 
 
-def noise_shaper(x_units, p):
-    """Error feedback: y = Q(x + H e), H = NTF - 1. Returns integer levels."""
+def noise_shaper(x_units, p, lim=None, e_max=2.0):
+    """Error feedback: y = Q(x + H e), H = NTF - 1. Returns integer levels.
+    On clipping the fed-back error is clamped to +-e_max LSB so the loop
+    filter state stays bounded (no limit cycles after overload)."""
     b, a = design_ntf(p)
     h_b = b - a                       # numerator of H, h_b[0] == 0
     n = len(a) - 1
     z = [0.0] * (n + 1)
-    lim = p.nh
+    if lim is None:
+        lim = p.nh
     out = np.empty(len(x_units), dtype=np.int64)
     hb = h_b.tolist()
     aa = a.tolist()
@@ -169,6 +178,10 @@ def noise_shaper(x_units, p):
         elif q < -lim:
             q = -lim
         e = q - v
+        if e > e_max:
+            e = e_max
+        elif e < -e_max:
+            e = -e_max
         # transposed DF-II update for H = h_b / a, driven by e, output w
         for i in range(n):
             z[i] = hb[i + 1] * e - aa[i + 1] * w + z[i + 1]
@@ -401,14 +414,19 @@ def run(p: Params, seed=1):
     m = xi
     if p.feedforward:
         m = m * p.vbus / vbus_fn(t_upd + 0.5 / p.f_upd)
+    n_min = int(np.ceil(p.min_pulse / p.tick - 1e-9))
+    m_lim = p.nh - n_min                      # max |M| in ticks
+    m_in = (m_lim - p.clip_headroom) / p.nh   # input clip (normalised)
+    m = np.clip(m, -m_in, m_in)
     m = pwm_linearise(m, p.pwm_corr)
     m_units = m * p.nh
 
     if p.quantize:
         if p.bd_split == "even":
-            q = 2 * noise_shaper(m_units / 2, replace(p, f_oser=p.f_oser / 2))
+            q = 2 * noise_shaper(m_units / 2, replace(p, f_oser=p.f_oser / 2),
+                                 lim=m_lim // 2)
         else:
-            q = noise_shaper(m_units, p)
+            q = noise_shaper(m_units, p, lim=m_lim)
         na, nb = split_bd(q, p.nh)
         ta, la = leg_edges(na, p)
         tb, lb = leg_edges(nb, p)
@@ -444,8 +462,16 @@ def run(p: Params, seed=1):
     seg = yo[start: start + p.n_fft]
     res = analyse(seg, p, kf)
     res["params"] = p
+    res["min_pulse_ticks"] = min(_min_pulse(ta), _min_pulse(tb))
+    res["n_min"] = n_min
     res["switch_rate"] = (len(ta) + len(tb)) / (n_in / p.fs_in)
     return res
+
+
+def _min_pulse(t_edges):
+    """Shortest high or low interval of a leg (ticks)."""
+    d = np.diff(np.asarray(t_edges))
+    return int(d.min()) if len(d) else 10 ** 9
 
 
 def pwm_linearise(x, mode):
