@@ -465,6 +465,8 @@ def run(p: Params, seed=1):
     res["min_pulse_ticks"] = min(_min_pulse(ta), _min_pulse(tb))
     res["n_min"] = n_min
     res["switch_rate"] = (len(ta) + len(tb)) / (n_in / p.fs_in)
+    # commanded (int ticks) and actual (float ticks) edges, new levels
+    res["edges"] = dict(ta=ta, tb=tb, ta_f=ta_f, tb_f=tb_f, la=la, lb=lb)
     return res
 
 

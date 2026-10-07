@@ -54,8 +54,16 @@ def evaluate(cfg, plants, p, f, w, delay=None):
                 mm=mm_min, b=b, a=a)
 
 
-def search_pre(p, f, w):
-    one = (np.zeros((1, 1)), np.zeros(1), np.zeros(1), 1.0, np.ones(len(w)))
+def search_pre(p, f, w, kernel="sinc1", adc_delay=0.0):
+    """Plant of the pre loop: 1 (sinc1) or (1 + z^-1)/2 (sinc2 triangle).
+    adc_delay (halves) = signal delay of the feedback ADC, included in the
+    frequency-domain margin check."""
+    extra = np.exp(-1j * w * adc_delay)
+    if kernel == "sinc1":
+        one = (np.zeros((1, 1)), np.zeros(1), np.zeros(1), 1.0, extra)
+    else:
+        P = (0.5 + 0.5 * np.exp(-1j * w)) * extra
+        one = (np.zeros((1, 1)), np.ones(1), 0.5 * np.ones(1), 0.5, P)
     plants = [one]
     best = []
     for n_int, fc, fzr in itertools.product([1, 2, 3], np.geomspace(20e3, 250e3, 24),

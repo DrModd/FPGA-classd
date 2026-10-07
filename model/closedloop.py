@@ -59,9 +59,10 @@ class LoopParams:
     pre: dict = field(default_factory=lambda: dict(n_int=3, fc=67e3, fz_ratio=0.2))
     post: dict = field(default_factory=lambda: dict(n_int=2, fc=17e3, fz_ratio=0.2))
     r_nominal: float = 8.0            # load of the reference model (post loop)
-    # pre loop measures area - d/dt(first moment): a pulse moved by d adds
-    # -a*d*delta'(t) to the baseband, which the area alone does not see
-    moment: bool = True
+    # pre-loop measurement kernel: "sinc1" area of half k, "sinc2" triangle
+    # over halves k-1, k (2nd-order nulls, +0.5 half of delay)
+    pre_kernel: str = "sinc1"
+    adc_err: object = None            # per-half measurement error to inject
 
 
 # ----------------------------------------------------------------------------
@@ -310,7 +311,7 @@ def simulate(p: Params, lp: LoopParams, seed=1):
     corr_pre = np.zeros(K + 2 + lp.delay)
     corr_post = np.zeros(K + 2 + lp.delay)
     w_prev = 0.0
-    mu_prev = 0.0
+    m_prev = t_prev = 0.0
     td, coss = p.deadtime, p.coss
     two_pi_fr = 2 * np.pi * p.f_ripple
 
@@ -327,7 +328,6 @@ def simulate(p: Params, lp: LoopParams, seed=1):
             ev = [(na, 0, 0), (nb, 1, 0)]
         ev.sort()
         t_cur, area, mom, j_sub, ei = 0.0, 0.0, 0.0, 0, 0
-        cc = nh / 2
         a_half, b_half = 0.0, 0.0
         while j_sub < SUB:
             u = np.array([uA * vb, uB * vb])
@@ -349,7 +349,7 @@ def simulate(p: Params, lp: LoopParams, seed=1):
                 te = min(tc + sh / p.tick, t_b - 1e-6)
                 xs = disc.step(xs, u, te - t_cur)
                 area += (uA - uB) * (te - t_cur)
-                mom += (uA - uB) * ((te - cc) ** 2 - (t_cur - cc) ** 2) / 2
+                mom += (uA - uB) * (te * te - t_cur * t_cur) / 2
                 t_cur = te
                 if leg == 0:
                     uA = lvl
@@ -359,7 +359,7 @@ def simulate(p: Params, lp: LoopParams, seed=1):
                 continue
             xs = disc.step(xs, u, t_b - t_cur)
             area += (uA - uB) * (t_b - t_cur)
-            mom += (uA - uB) * ((t_b - cc) ** 2 - (t_cur - cc) ** 2) / 2
+            mom += (uA - uB) * (t_b * t_b - t_cur * t_cur) / 2
             t_cur = t_b
             ia, ib = xs[ns], xs[ns + 1]
             idx = k * SUB + j_sub
@@ -369,11 +369,17 @@ def simulate(p: Params, lp: LoopParams, seed=1):
             xs[ns] = xs[ns + 1] = 0.0
             j_sub += 1
 
-        y_pre = area / nh * vb / p.vbus
-        mu = mom / nh ** 2 * vb / p.vbus
-        if lp.moment:
-            y_pre -= mu - mu_prev
-        mu_prev = mu
+        a_k = area / nh * vb / p.vbus
+        m_k = mom / nh ** 2 * vb / p.vbus
+        if lp.pre_kernel == "sinc2":
+            y_pre = m_prev + a_k - m_k
+            t_meas = 0.5 * (t_prev + target)
+        else:
+            y_pre = a_k
+            t_meas = target
+        m_prev, t_prev = m_k, target
+        if lp.adc_err is not None and k < len(lp.adc_err):
+            y_pre += lp.adc_err[k]
         if lp.post_order == 1:
             y_post = a_half / th
         else:
@@ -383,7 +389,7 @@ def simulate(p: Params, lp: LoopParams, seed=1):
             y_pre += rng.normal(0, lp.adc_noise)
             y_post += rng.normal(0, lp.adc_noise)
         if c_pre is not None:
-            corr_pre[k + 1 + lp.delay] = c_pre(target - y_pre)
+            corr_pre[k + 1 + lp.delay] = c_pre(t_meas - y_pre)
         if c_post is not None:
             corr_post[k + 1 + lp.delay] = c_post(rm[k] - y_post)
 
