@@ -54,6 +54,8 @@ class AdcParams:
     mode: str = "replica"         # direct | replica
     gain: float = 16.0            # replica gain G (direct uses 0.8)
     replica_skew: float = 0.5e-9  # residual delay mismatch of the replica
+    hyst: float = 0.0             # comparator hysteresis, state units
+    coef: object = None           # (a1, a2, k0) override, e.g. from real parts
 
 
 # ----------------------------------------------------------------------------
@@ -104,6 +106,8 @@ def design(ap: AdcParams):
     A, T = ct_matrices(ap)
     if ap.kind in ("P1", "A1"):
         return dict(a=np.array([1.0]), k0=0.0)
+    if ap.coef is not None:
+        return dict(a=np.array(ap.coef[:2]), k0=ap.coef[2])
     tau = ap.eld
     nmatch = 8
     tgt = -target_l(ap.obg, nmatch)
@@ -214,7 +218,7 @@ def modulate(Au, Mu, ap: AdcParams, seed=2):
     dp = 1.0
     for k in range(n):
         y = x1 - k0 * dp + cn[k]
-        dk = 1.0 if y >= 0 else -1.0
+        dk = 1.0 if y >= -0.5 * ap.hyst * dp else -1.0
         n0 = e00 * x0 + e01 * x1 + q0 * dp + g0 * dk
         n1 = e10 * x0 + e11 * x1 + q1 * dp + g1 * dk
         # input (area / first moment), leak over one clock neglected
