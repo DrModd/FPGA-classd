@@ -1,8 +1,8 @@
 """
 Sample-level model of rtl/jitter_fifo.v (same state machine, same integer
-arithmetic of the Catmull-Rom interpolator), driven by two independent
-sample clocks. Used to check the algorithm: start-up, drift in both
-directions, pauses, interpolation error.
+arithmetic of the polyphase FIR interpolator, coefficients read from the same
+.hex tables), driven by two independent sample clocks. Used to check the
+algorithm: start-up, drift in both directions, pauses, interpolation error.
 
     python jitter_fifo/model/jfifo_model.py   -> jitter_fifo/results.md
 """
@@ -12,19 +12,37 @@ import bisect
 import numpy as np
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "results.md")
+RTL = os.path.join(os.path.dirname(__file__), "..", "rtl")
+TABLES = {  # name -> (NT, MPH_SH)
+    "fir_ls64_m128.hex": (64, 7),
+    "fir_ls64_m64.hex": (64, 6),
+    "fir_ls32_m128.hex": (32, 7),
+    "fir_cr4.hex": (4, 10),
+}
+_cache = {}
+
+
+def load_table(name, CW=30):
+    if name not in _cache:
+        NT, MPH = TABLES[name]
+        with open(os.path.join(RTL, name)) as fh:
+            v = np.array([int(l, 16) for l in fh if l.strip()], dtype=np.int64)
+        v = np.where(v >= 1 << (CW - 1), v - (1 << CW), v)
+        _cache[name] = (v.reshape((1 << MPH) + 1, NT), NT, MPH)
+    return _cache[name]
 
 S_INIT, S_RUN, S_PAUSE = 0, 1, 2
 M_NORM, M_SLOW, M_FAST = 0, 1, 2
 
 
-def rnd(p, s):
-    return (p + (1 << (s - 1))) >> s
-
-
 class JFifo:
     def __init__(self, AW=10, DW=32, LO_PCT=20, HI_PCT=80, FW=16, STEP_SH=10,
-                 pause_thr=0, pause_len=0, lat_s=0.0):
+                 pause_thr=0, pause_len=0, lat_s=0.0, table="fir_ls64_m128.hex", CW=30):
         self.AW, self.DW, self.FW = AW, DW, FW
+        self.C, self.NT, self.MPH = load_table(table, CW)
+        self.NH = self.NT // 2
+        self.MU = FW - self.MPH
+        self.CSH = CW - 2
         self.D = 1 << AW
         self.HALF = self.D // 2
         self.LO = self.D * LO_PCT // 100
@@ -33,7 +51,7 @@ class JFifo:
         self.DELTA = 1 << (FW - STEP_SH)
         self.thr, self.plen = pause_thr, pause_len
         self.lat = lat_s
-        self.mem = [(0, 0, 0, 0)] * self.D
+        self.mem = np.zeros((self.D, 4), dtype=np.int64)   # L, R, START, END
         # write side
         self.wptr = 0
         self.wtimes = []
@@ -71,7 +89,7 @@ class JFifo:
             tag_e = 1 if self.in_pause else 0
             self.in_pause, self.qcnt = False, 0
         used = self.wptr - self.rd
-        if used < self.D - 1:
+        if used < self.D - self.NH + 1:
             self.mem[self.wptr % self.D] = (l, r, tag_s | self.pend_s, tag_e | self.pend_e)
             self.wptr += 1
             self.wtimes.append(t)
@@ -104,7 +122,7 @@ class JFifo:
                 self.ONE + self.DELTA if self.mode == M_FAST else self.ONE
             psum = self.frac + step
             adv, fr = psum >> self.FW, psum & (self.ONE - 1)
-            if avail <= adv + 2 or avail >= self.D - 2:
+            if avail <= adv + self.NH or avail >= self.D - self.NH:
                 self.st, self.mode = S_INIT, M_NORM
                 self.xruns += 1
                 self.y = (0, 0)
@@ -140,25 +158,24 @@ class JFifo:
         return out, info
 
     def _fetch(self, skip_s):
-        w = [self.word(self.rd + k) for k in (-1, 0, 1, 2)]
-        self.t1_s = w[2][2]
-        if self.st == S_RUN and (w[1][2] or skip_s) and not w[1][3]:
+        NH = self.NH
+        x0, x1 = self.word(self.rd), self.word(self.rd + 1)
+        self.t1_s = int(x1[2])
+        if self.st == S_RUN and (x0[2] or skip_s) and not x0[3]:
             self.st = S_PAUSE
         if self.frac == 0:
-            self.y = (w[1][0], w[1][1])
+            self.y = (int(x0[0]), int(x0[1]))
             return
-        t = self.frac
+        idx = (self.rd - (NH - 1) + np.arange(self.NT)) % self.D
+        w = self.mem[idx]
+        j, mu = self.frac >> self.MU, self.frac & ((1 << self.MU) - 1)
+        c0, c1 = self.C[j], self.C[j + 1]
+        c = c0 + (((c1 - c0) * mu + (1 << (self.MU - 1))) >> self.MU)
+        lim = 1 << (self.DW - 1)
         ys = []
-        for c in (0, 1):
-            pm1, p0, p1, p2 = (w[k][c] for k in range(4))
-            a = p1 - pm1
-            b = 2 * pm1 - 5 * p0 + 4 * p1 - p2
-            cc = 3 * p0 - 3 * p1 + p2 - pm1
-            h = cc
-            h = b + rnd(h * t, self.FW)
-            h = a + rnd(h * t, self.FW)
-            y = p0 + rnd(h * t, self.FW + 1)
-            lim = 1 << (self.DW - 1)
+        for ch in (0, 1):
+            acc = int(np.dot(w[:, ch], c))         # |acc| < 2^62: exact in int64
+            y = (acc + (1 << (self.CSH - 1))) >> self.CSH
             ys.append(max(-lim, min(lim - 1, y)))
         self.y = tuple(ys)
 
@@ -229,7 +246,8 @@ def main():
              "независимых тактов, писатель быстрее/медленнее на заданные ppm.\n"]
 
     # ---- 1. start-up and drift both ways ----
-    lines.append("## Старт и уход частоты (AW = 8, 256 отсчётов, STEP_SH = 10 → 977 ppm)\n")
+    lines.append("## Старт и уход частоты (AW = 8, 256 отсчётов, STEP_SH = 10 → 977 ppm, "
+                 "таблица fir_ls64_m128)\n")
     lines.append("| Сценарий | Нулей на старте | xrun | Включений интерполяции | "
                  "Доля времени с интерполяцией | Мин/макс заполнение после старта | "
                  "Ошибка интерполяции 1 кГц, дБ |\n|---|---:|---:|---:|---:|---:|---:|\n")
@@ -254,18 +272,21 @@ def main():
     # ---- 2. interpolation error vs frequency ----
     lines.append("\nПри +1200 ppm скорость коррекции (977 ppm) меньше расхождения тактов, "
                  "буфер переполняется — нужен STEP_SH = 9.\n")
-    lines.append("\n## Ошибка кубической интерполяции (во время коррекции)\n")
-    lines.append("| Частота | 48 кГц, дБ | 192 кГц, дБ |\n|---|---:|---:|\n")
-    for fsig in (1000, 5000, 10000, 20000):
-        row = []
+    lines.append("\n## Ошибка интерполяции во время коррекции (синус 0,5 FS, писатель +700 ppm)\n")
+    lines.append("RMS ошибки интерполированных отсчётов относительно идеального синуса в точке "
+                 "чтения, дБ относительно сигнала.\n\n")
+    lines.append("| Таблица | Fs | 1 кГц | 5 кГц | 10 кГц | 20 кГц |\n|---|---|---:|---:|---:|---:|\n")
+    for table in ("fir_cr4.hex", "fir_ls32_m128.hex", "fir_ls64_m128.hex"):
         for fs in (48000, 192000):
-            f = JFifo(AW=8)
-            x, A = sine_src(fsig, fs)
-            r = simulate(f, x, fs, +700, 6.0)
-            e_int, _, _ = interp_error_db(r, fsig, fs, A)
-            row.append(e_int)
-        lines.append(f"| {fsig/1000:g} кГц | {row[0]:.1f} | {row[1]:.1f} |\n")
-        print("interp", fsig, row, flush=True)
+            row = []
+            for fsig in (1000, 5000, 10000, 20000):
+                f = JFifo(AW=8, table=table)
+                x, A = sine_src(fsig, fs)
+                r = simulate(f, x, fs, +700, 4.0)
+                e_int, _, _ = interp_error_db(r, fsig, fs, A)
+                row.append(e_int)
+            lines.append(f"| {table} | {fs/1000:g} кГц | " + " | ".join(f"{v:.1f}" for v in row) + " |\n")
+            print("interp", table, fs, [round(v, 1) for v in row], flush=True)
 
     # ---- 3. pauses ----
     lines.append("\n## Паузы (AW = 10, 48 кГц, писатель +300 ppm, порог 16, пауза ≥ 4800 отсчётов)\n")

@@ -4,9 +4,11 @@
 //  * 2 channels x DW bits, stored in block RAM (one word = L, R, 2 tag bits)
 //  * write and read in independent clock domains, pointers cross via Gray code
 //  * start-up: outputs zeros until the buffer is 50 % full, then plays
-//  * fill < LO_PCT or > HI_PCT: the read side resamples with a 4-point
-//    cubic (Catmull-Rom) interpolator at a rate of 1 -/+ 2^-STEP_SH until
-//    the fill is back at 50 % (then it returns to bit-exact playback)
+//  * fill < LO_PCT or > HI_PCT: the read side resamples at a rate of
+//    1 -/+ 2^-STEP_SH with a polyphase FIR interpolator (NT taps, table of
+//    2^MPH_SH + 1 phases in block RAM, coefficients linearly interpolated
+//    between neighbouring phases) until the fill is back at 50 %, then it
+//    returns to bit-exact playback
 //  * pause detector on the input: after pause_len samples with
 //    |L|,|R| <= pause_thr a START tag is written with the sample, the first
 //    loud sample gets an END tag. The read side acts when it reaches the
@@ -18,6 +20,17 @@
 //    so the buffer is re-initialised at the start of every pause and is at
 //    50 % when the music comes back, however long the pause was.
 //
+// Interpolator: y = sum_n x[rd_int - NT/2 + 1 + n] * c_n(frac), n = 0..NT-1,
+//   c_n = C[j][n] + ((C[j+1][n] - C[j][n]) * mu + 2^(MU-1)) >>> MU,
+//   j = frac[FW-1:MU], mu = frac[MU-1:0], MU = FW - MPH_SH,
+//   C in Q.(CW-2), file COEF_FILE (hex, address j*NT + n, j = 0..2^MPH_SH),
+//   y = sat((sum + 2^(CW-3)) >>> (CW-2)).
+// Tables (jitter_fifo/model/gen_coefs.py): fir_ls64_m128.hex (NT 64, MPH_SH 7,
+// default), fir_ls64_m64.hex (64, 6), fir_ls32_m128.hex (32, 7, for high
+// rates), fir_cr4.hex (4, 10, Catmull-Rom, the old cubic interpolator).
+// One tap per rd_clk cycle (the FIFO RAM has one read port); the ROM is read
+// through two ports (C[j] and C[j+1]): a true dual-port block RAM.
+//
 // Strobes: wr_stb / rd_stb are the sample clocks (one rising edge per sample)
 // and may be asynchronous to wr_clk / rd_clk (SYNC_STB synchroniser stages).
 // in_l / in_r must be stable for SYNC_STB + 3 wr_clk cycles after the wr_stb
@@ -25,12 +38,14 @@
 // rd_stb rising edge (out_valid pulses for one cycle) and then hold for the
 // whole sample period.
 //
-// Clock requirements: wr_clk >= 8 x Fs, rd_clk >= 32 x Fs
-// (e.g. 49.152 MHz covers 44.1 ... 768 kHz with margin).
+// Clock requirements: wr_clk >= 8 x Fs, rd_clk >= (NT + 16) x Fs
+//   NT = 64: 80 x Fs  (49.152 MHz up to 384 kHz, 98.304 MHz up to 768 kHz)
+//   NT = 32: 48 x Fs  (49.152 MHz up to 768 kHz)
 //
-// Depth: 2**AW words (AW >= 4). Gray-code pointers need a power of two;
-// the largest AW is limited by the block RAM of the device
-// (memory width 2*DW + 2 = 66 bits for DW = 32).
+// Depth: 2**AW words. Gray-code pointers need a power of two; the largest AW
+// is limited by the block RAM of the device (memory width 2*DW + 2 = 66 bits
+// for DW = 32). LO must be >= NT/2 + 3 and HI <= DEPTH - NT/2 - 2
+// (NT = 64: AW >= 8).
 //
 // Both resets must be applied together (a write-side reset alone loses the
 // pause state of the stream).
@@ -54,7 +69,11 @@ module jitter_fifo #(
     parameter integer HI_PCT   = 80,   // above: speed-up interpolation
     parameter integer FW       = 16,   // fraction bits of the read position
     parameter integer STEP_SH  = 10,   // rate offset 2^-STEP_SH (STEP_SH <= FW)
-    parameter integer SYNC_STB = 2     // strobe synchroniser stages, 0 = in-domain
+    parameter integer SYNC_STB = 2,    // strobe synchroniser stages, 0 = in-domain
+    parameter integer NT       = 64,   // interpolator taps (even, >= 4)
+    parameter integer MPH_SH   = 7,    // 2^MPH_SH stored phases (1 .. FW-1)
+    parameter integer CW       = 30,   // coefficient width, Q.(CW-2)
+    parameter          COEF_FILE = "fir_ls64_m128.hex"
 ) (
     // ---------------- write domain ----------------
     input  wire          wr_clk,
@@ -76,6 +95,7 @@ module jitter_fifo #(
     output wire          flag_low,    // fill < LO_PCT: slowing down (interpolating)
     output wire          flag_high,   // fill > HI_PCT: speeding up (interpolating)
     output reg           xrun,        // pulse: under/overflow, re-initialised
+    output reg           rd_late,     // pulse: rd_stb edge while still busy (rd_clk too slow)
     output wire          running,     // initialised, data flowing
     output wire          pause,       // inside a pause (outputs zero)
     output reg  [AW:0]   fill         // samples in the buffer, read-side view
@@ -90,6 +110,22 @@ module jitter_fifo #(
     localparam integer HI    = (DEPTH * HI_PCT) / 100;
     localparam integer MW    = 2 * DW + 2;            // {end, start, R, L}
     localparam integer WS    = SYNC_STB + 1;
+    localparam integer NH    = NT / 2;                // taps before/after x0: NH-1 / NH
+    localparam integer MU    = FW - MPH_SH;           // phase interpolation bits
+    localparam integer NPH   = (1 << MPH_SH) + 1;     // stored phases
+    localparam integer CSH   = CW - 2;                // coefficient scale 2^CSH
+
+    function integer clog2;
+        input integer v;
+        integer r;
+        begin
+            r = 0;
+            while ((1 << r) < v) r = r + 1;
+            clog2 = r;
+        end
+    endfunction
+    localparam integer RAW   = clog2(NPH * NT);       // coefficient ROM address bits
+    localparam integer CNW   = clog2(NT + 8);         // sequencer counter bits
 
     localparam [FW+1:0] ONE   = {2'b01, {FW{1'b0}}};
     localparam [FW+1:0] DELTA = {{(FW+1){1'b0}}, 1'b1} << (FW - STEP_SH);
@@ -102,8 +138,14 @@ module jitter_fifo #(
         if (STEP_SH < 1 || STEP_SH > FW) begin : bad_step
             jitter_fifo_ERROR_STEP_SH_must_be_1_to_FW bad();
         end
-        if (LO < 5 || HI > DEPTH - 4 || LO >= HALF || HI <= HALF) begin : bad_thr
-            jitter_fifo_ERROR_LO_HI_PCT_out_of_range bad();
+        if (LO < NH + 3 || HI > DEPTH - NH - 2 || LO >= HALF || HI <= HALF) begin : bad_thr
+            jitter_fifo_ERROR_LO_HI_PCT_out_of_range_or_AW_too_small_for_NT bad();
+        end
+        if (NT < 4 || (NT % 2) != 0) begin : bad_nt
+            jitter_fifo_ERROR_NT_must_be_even_and_at_least_4 bad();
+        end
+        if (MPH_SH < 1 || MPH_SH > FW - 1) begin : bad_mph
+            jitter_fifo_ERROR_MPH_SH_must_be_1_to_FW_minus_1 bad();
         end
     endgenerate
 
@@ -172,8 +214,8 @@ module jitter_fifo #(
         else        begin rg_s1 <= rpub_gray; rg_s2 <= rg_s1; end
     wire [AW:0] rptr_w = gray2bin(rg_s2);
     wire [AW:0] used_w = wptr - rptr_w;
-    // keep the word at rd_int-1 (oldest one the interpolator needs) intact
-    wire        full_w = (used_w >= DEPTH - 1);
+    // keep the word at rd_int-(NH-1) (oldest one the interpolator needs) intact
+    wire        full_w = (used_w >= DEPTH - NH + 1);
 
     // pause detector
     reg [23:0] qcnt;
@@ -265,33 +307,33 @@ module jitter_fifo #(
     localparam [1:0] M_NORM = 2'd0, M_SLOW = 2'd1, M_FAST = 2'd2;
     // sequencer
     localparam [2:0] Q_IDLE = 3'd0, Q_DEC = 3'd1, Q_FETCH = 3'd2,
-                     Q_PFETCH = 3'd3, Q_PDEC = 3'd4, Q_CALC = 3'd5;
+                     Q_PFETCH = 3'd3, Q_PDEC = 3'd4;
 
-    reg  [1:0]    st, mode;
-    reg  [2:0]    seq;
-    reg  [2:0]    cnt;
-    reg  [AW:0]   rd_int;                     // index of x0
-    reg  [FW-1:0] frac;                       // position = rd_int + frac / 2^FW
-    reg  [AW:0]   avail;                      // wptr_r - rd_int at the strobe
-    reg           t1_s, skip_s, t0_s;         // START tags (x1, skipped word, x0)
-    reg           t0_e;                       // END tag of x0
-    reg  [3:0]    ev;                         // END tags of rd_int+1 .. +4 (pause)
-    reg  [DW-1:0] xm1_l, x0_l, x1_l, x2_l;
-    reg  [DW-1:0] xm1_r, x0_r, x1_r, x2_r;
-    reg  [DW-1:0] y_l, y_r;                   // next output sample
+    reg  [1:0]     st, mode;
+    reg  [2:0]     seq;
+    reg  [CNW-1:0] cnt;
+    reg  [AW:0]    rd_int;                    // index of x0
+    reg  [FW-1:0]  frac;                      // position = rd_int + frac / 2^FW
+    reg  [AW:0]    avail;                     // wptr_r - rd_int at the strobe
+    reg            t1_s, skip_s, t0_s;        // START tags (x1, skipped word, x0)
+    reg            t0_e;                      // END tag of x0
+    reg  [3:0]     ev;                        // END tags of rd_int+1 .. +4 (pause)
+    reg  [DW-1:0]  x0_l, x0_r;
+    reg  [DW-1:0]  y_l, y_r;                  // next output sample
 
     assign flag_low  = (st == S_RUN) && (mode == M_SLOW);
     assign flag_high = (st == S_RUN) && (mode == M_FAST);
     assign running   = (st != S_INIT);
     assign pause     = (st == S_PAUSE);
 
-    // RAM read address for the current sequencer step
     // silent words to consume per output sample in pause
     wire [AW:0] over = avail - HALF;
     wire [2:0]  pc   = (avail < HALF) ? 3'd0 :
                        (over >= 3)    ? 3'd4 : over[2:0] + 3'd1;
 
-    assign raddr = (seq == Q_FETCH)  ? rd_int + cnt - 1'b1 :
+    // RAM read address for the current sequencer step:
+    // FETCH reads tap n = cnt, word rd_int - (NH-1) + n
+    assign raddr = (seq == Q_FETCH)  ? rd_int - (NH - 1) + cnt :
                    (seq == Q_PFETCH) ? rd_int + cnt + 1'b1 :
                                        rd_int;
 
@@ -301,31 +343,66 @@ module jitter_fifo #(
     wire [FW+1:0] psum = {2'b00, frac} + step;
     wire [1:0]    adv  = psum[FW+1:FW];
 
-    // ---- cubic interpolation datapath (one multiplier, sequential) ----
-    localparam integer HW = DW + 8;           // Horner accumulator width
-    reg               ch;                     // 0 = L, 1 = R
-    reg  [2:0]        k;
-    reg  signed [HW-1:0] ca, cb, h;
-    reg  signed [63:0]   prod;
-    wire signed [FW:0]   t = {1'b0, frac};
+    // ------------------------------------------------------------------
+    // polyphase FIR datapath, one tap per clock
+    //   edge(cnt = n)     : RAM and ROM latch the addresses of tap n
+    //   edge(cnt = n + 1) : d1 <= data, cb <= C[j][n], cd <= C[j+1][n] - C[j][n]
+    //   edge(cnt = n + 2) : cdm <= cd * mu, cb2 <= cb, d2 <= d1
+    //   edge(cnt = n + 3) : coef <= cb2 + round(cdm / 2^MU), d3 <= d2
+    //   edge(cnt = n + 4) : p <= d3 * coef
+    //   edge(cnt = n + 5) : acc <= acc + p          (cnt = 5 .. NT+4)
+    //   cnt = NT + 5      : y = sat(round(acc / 2^CSH))
+    // ------------------------------------------------------------------
+    (* syn_romstyle = "block_rom" *)
+    reg [CW-1:0] rom [0:NPH*NT-1];
+    initial $readmemh(COEF_FILE, rom);
 
-    wire signed [HW-1:0] pm1 = $signed(ch ? xm1_r : xm1_l);
-    wire signed [HW-1:0] p0  = $signed(ch ? x0_r  : x0_l);
-    wire signed [HW-1:0] p1  = $signed(ch ? x1_r  : x1_l);
-    wire signed [HW-1:0] p2  = $signed(ch ? x2_r  : x2_l);
+    wire [MPH_SH-1:0] ph = frac[FW-1:MU];
+    wire [MU-1:0]     mu = frac[MU-1:0];
+    // addresses only matter for cnt < NT; kept inside the table otherwise
+    wire [RAW-1:0]    ra0 = ph * NT + ((cnt < NT) ? cnt : 0);
+    wire [RAW-1:0]    ra1 = ra0 + NT;
+    reg  [CW-1:0]     c0q, c1q;
+    always @(posedge rd_clk) begin              // dual-port ROM, registered output
+        c0q <= rom[ra0];
+        c1q <= rom[ra1];
+    end
 
-    // Catmull-Rom: y = x0 + t/2 * (a + t * (b + t * c))
-    wire signed [HW-1:0] a_c = p1 - pm1;
-    wire signed [HW-1:0] b_c = (pm1 <<< 1) - (p0 <<< 2) - p0 + (p1 <<< 2) - p2;
-    wire signed [HW-1:0] c_c = (p0 <<< 1) + p0 - (p1 <<< 1) - p1 + p2 - pm1;
+    localparam integer PW = DW + CW + 1;        // product width
+    reg  signed [DW-1:0] d1_l, d1_r, d2_l, d2_r, d3_l, d3_r;
+    reg  signed [CW-1:0] cb, cb2;
+    reg  signed [CW:0]   cd;
+    reg  signed [CW+MU+1:0] cdm;
+    reg  signed [CW:0]   coef;
+    reg  signed [PW-1:0] p_l, p_r;
+    reg  signed [63:0]   acc_l, acc_r;
 
-    wire signed [63:0] rnd_fw  = (prod + (64'sd1 <<< (FW - 1))) >>> FW;
-    wire signed [63:0] rnd_fw1 = (prod + (64'sd1 <<< FW)) >>> (FW + 1);
-    wire signed [63:0] yfull   = p0 + rnd_fw1;
+    wire signed [CW+MU+1:0] cdr  = (cdm + (1 <<< (MU - 1))) >>> MU;
+
     localparam signed [63:0] YMAX =  (64'sd1 <<< (DW - 1)) - 1;
     localparam signed [63:0] YMIN = -(64'sd1 <<< (DW - 1));
-    wire [DW-1:0] ysat = (yfull > YMAX) ? YMAX[DW-1:0] :
-                         (yfull < YMIN) ? YMIN[DW-1:0] : yfull[DW-1:0];
+    wire signed [63:0] yr_l = (acc_l + (64'sd1 <<< (CSH - 1))) >>> CSH;
+    wire signed [63:0] yr_r = (acc_r + (64'sd1 <<< (CSH - 1))) >>> CSH;
+    wire [DW-1:0] ys_l = (yr_l > YMAX) ? YMAX[DW-1:0] :
+                         (yr_l < YMIN) ? YMIN[DW-1:0] : yr_l[DW-1:0];
+    wire [DW-1:0] ys_r = (yr_r > YMAX) ? YMAX[DW-1:0] :
+                         (yr_r < YMIN) ? YMIN[DW-1:0] : yr_r[DW-1:0];
+
+    always @(posedge rd_clk) begin              // free-running pipeline stages
+        d1_l <= rdata[DW-1:0];
+        d1_r <= rdata[2*DW-1:DW];
+        cb   <= c0q;
+        cd   <= $signed({c1q[CW-1], c1q}) - $signed({c0q[CW-1], c0q});
+        cdm  <= cd * $signed({1'b0, mu});
+        cb2  <= cb;
+        d2_l <= d1_l;
+        d2_r <= d1_r;
+        coef <= $signed({cb2[CW-1], cb2}) + $signed(cdr[CW:0]);
+        d3_l <= d2_l;
+        d3_r <= d2_r;
+        p_l  <= d3_l * coef;
+        p_r  <= d3_r * coef;
+    end
 
     // ---- published read pointer for the write side ----
     // rd_int only moves forward; the published copy follows it one step per
@@ -339,19 +416,24 @@ module jitter_fifo #(
             rpub_gray <= bin2gray(rpub);
         end
 
+    // pause entry at the end of a fetch: play this (silent) sample, then
+    // pause; a pause that already ended on this very word (END on x0) is not
+    // entered
+    wire enter_pause = (st == S_RUN) && (t0_s || skip_s) && !t0_e;
+
     always @(posedge rd_clk) begin
         if (rd_rst) begin
             st <= S_INIT; mode <= M_NORM; seq <= Q_IDLE; cnt <= 0;
             rd_int <= 0; frac <= 0; avail <= 0; fill <= 0;
             t1_s <= 1'b0; skip_s <= 1'b0; t0_s <= 1'b0; t0_e <= 1'b0; ev <= 4'd0;
-            xm1_l <= 0; x0_l <= 0; x1_l <= 0; x2_l <= 0;
-            xm1_r <= 0; x0_r <= 0; x1_r <= 0; x2_r <= 0;
+            x0_l <= 0; x0_r <= 0;
             y_l <= 0; y_r <= 0; out_l <= 0; out_r <= 0;
-            out_valid <= 1'b0; xrun <= 1'b0;
-            ch <= 1'b0; k <= 0; ca <= 0; cb <= 0; h <= 0; prod <= 0;
+            out_valid <= 1'b0; xrun <= 1'b0; rd_late <= 1'b0;
+            acc_l <= 0; acc_r <= 0;
         end else begin
             out_valid <= 1'b0;
             xrun      <= 1'b0;
+            rd_late   <= r_edge && (seq != Q_IDLE);
 
             case (seq)
             // ---------------------------------------------------------
@@ -381,7 +463,7 @@ module jitter_fifo #(
                         seq <= Q_IDLE;
                     end
                 S_RUN:
-                    if ((avail <= {{(AW-1){1'b0}}, adv} + 2) || (avail >= DEPTH - 2)) begin
+                    if ((avail <= {{(AW-1){1'b0}}, adv} + NH) || (avail >= DEPTH - NH)) begin
                         // underflow / overflow: start again from 50 %
                         st   <= S_INIT;
                         mode <= M_NORM;
@@ -408,40 +490,43 @@ module jitter_fifo #(
                 end
                 endcase
             // ---------------------------------------------------------
-            // read x[-1], x0, x1, x2 (RAM output one clock after the address)
+            // walk the NT-tap window; x0 = tap NH-1, x1 = tap NH
             Q_FETCH: begin
                 cnt <= cnt + 1'b1;
-                case (cnt)
-                3'd1: begin xm1_l <= rdata[DW-1:0]; xm1_r <= rdata[2*DW-1:DW]; end
-                3'd2: begin x0_l  <= rdata[DW-1:0]; x0_r  <= rdata[2*DW-1:DW];
-                            t0_s  <= rdata[MW-2]; t0_e <= rdata[MW-1]; end
-                3'd3: begin x1_l  <= rdata[DW-1:0]; x1_r  <= rdata[2*DW-1:DW];
-                            t1_s  <= rdata[MW-2]; end
-                3'd4: begin
-                    x2_l <= rdata[DW-1:0]; x2_r <= rdata[2*DW-1:DW];
-                    // play this (silent) sample, then pause; a pause that already
-                    // ended on this very word (END on x0) is not entered
-                    if (st == S_RUN && (t0_s || skip_s) && !t0_e)
-                        st <= S_PAUSE;
-                    if (frac == 0) begin              // on a sample: bit-exact copy
-                        y_l <= x0_l;
-                        y_r <= x0_r;
-                        seq <= Q_IDLE;
-                    end else begin
-                        ch  <= 1'b0;
-                        k   <= 0;
-                        seq <= Q_CALC;
-                    end
+                if (cnt == 0) begin
+                    acc_l <= 0;
+                    acc_r <= 0;
+                end else if (cnt >= 5 && cnt <= NT + 4) begin
+                    acc_l <= acc_l + p_l;
+                    acc_r <= acc_r + p_r;
                 end
-                default: ;
-                endcase
+                if (cnt == NH) begin                  // data of tap NH-1
+                    x0_l <= rdata[DW-1:0];
+                    x0_r <= rdata[2*DW-1:DW];
+                    t0_s <= rdata[MW-2];
+                    t0_e <= rdata[MW-1];
+                end
+                if (cnt == NH + 1)                    // data of tap NH
+                    t1_s <= rdata[MW-2];
+                if (frac == 0 && cnt == NH + 1) begin
+                    // on a sample: bit-exact copy, the rest of the window is not needed
+                    y_l <= x0_l;
+                    y_r <= x0_r;
+                    if (enter_pause) st <= S_PAUSE;
+                    seq <= Q_IDLE;
+                end else if (cnt == NT + 5) begin
+                    y_l <= ys_l;
+                    y_r <= ys_r;
+                    if (enter_pause) st <= S_PAUSE;
+                    seq <= Q_IDLE;
+                end
             end
             // ---------------------------------------------------------
             // pause: look at the END tags of the next four words
             Q_PFETCH: begin
                 cnt <= cnt + 1'b1;
-                if (cnt != 3'd0) ev[cnt - 1'b1] <= rdata[MW-1];
-                if (cnt == 3'd4) seq <= Q_PDEC;
+                if (cnt != 0) ev[cnt - 1'b1] <= rdata[MW-1];
+                if (cnt == 4) seq <= Q_PDEC;
             end
             Q_PDEC: begin
                 // consume pc silent words (0 = hold, up to 4 = drop 3 extra) to
@@ -467,30 +552,6 @@ module jitter_fifo #(
                     y_l <= 0; y_r <= 0;
                     seq <= Q_IDLE;
                 end
-            end
-            // ---------------------------------------------------------
-            // Catmull-Rom, Horner form, one multiply per step
-            Q_CALC: begin
-                k <= k + 1'b1;
-                case (k)
-                3'd0: begin ca <= a_c; cb <= b_c; h <= c_c; end
-                3'd1: prod <= h * t;
-                3'd2: h <= cb + $signed(rnd_fw[HW-1:0]);
-                3'd3: prod <= h * t;
-                3'd4: h <= ca + $signed(rnd_fw[HW-1:0]);
-                3'd5: prod <= h * t;
-                3'd6: begin
-                    if (ch == 1'b0) begin
-                        y_l <= ysat;
-                        ch  <= 1'b1;
-                        k   <= 0;
-                    end else begin
-                        y_r <= ysat;
-                        seq <= Q_IDLE;
-                    end
-                end
-                default: ;
-                endcase
             end
             default: seq <= Q_IDLE;
             endcase
