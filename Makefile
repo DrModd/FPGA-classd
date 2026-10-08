@@ -24,3 +24,19 @@ model:
 
 clean:
 	rm -rf build
+
+# ---- jitter_fifo ----
+JF = jitter_fifo/rtl/jitter_fifo.v jitter_fifo/tb/tb_jitter_fifo.v
+
+.PHONY: jf_sim jf_model
+jf_sim:
+	mkdir -p build
+	iverilog -g2005 -Wall -o build/tb_jf_fast $(JF)
+	iverilog -g2005 -Wall -Ptb_jitter_fifo.RD_PER=20.325 -o build/tb_jf_slow $(JF)
+	vvp build/tb_jf_fast
+	vvp build/tb_jf_slow
+
+jf_model:
+	python3 jitter_fifo/model/jfifo_model.py
+	python3 jitter_fifo/model/stress.py
+	python3 jitter_fifo/model/tb_scenario.py

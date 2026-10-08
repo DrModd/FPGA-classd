@@ -22,7 +22,8 @@ model/fb_adc_values.py  номиналы АЦП (E96) и проверка на �
 model/fixed_golden.py   побитная fixed-point модель RTL, коэффициенты rtl/*.vh, векторы tb/vectors/
 rtl/                    Verilog: interp8 (hb_stage x3), pwm_corr, ns_shaper, bd_pwm, classd_channel, oser16_out
 tb/tb_classd.v          самопроверяющийся тестбенч против векторов модели
-Makefile                make vectors | make sim | make model
+Makefile                make vectors | make sim | make model | make jf_sim | make jf_model
+jitter_fifo/            асинхронный кольцевой буфер с подстройкой заполнения (см. jitter_fifo/README.md)
 results/summary.md      таблица результатов
 results/*.png           спектры
 ```
